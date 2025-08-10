@@ -1,8 +1,4 @@
-import os
-import asyncio
-import json
-import time
-import signal
+import os, asyncio, json, time, signal, unicodedata
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -10,413 +6,369 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Body
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+# ---------- Configuration ----------
 TARGET_DIR = os.getenv("TARGET_DIR", "/data")
-CRF = os.getenv("CRF", "22")
-PRESET = os.getenv("PRESET", "veryfast")
-AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "160k")
-USE_NVENC = os.getenv("USE_NVENC", "false").lower() == "true"
-KEEP_ORIGINAL = os.getenv("KEEP_ORIGINAL", "false").lower() == "true"
-PRESERVE_TIMESTAMPS = os.getenv("PRESERVE_TIMESTAMPS", "true").lower() == "true"
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+RUNTIME = {
+    "crf": os.getenv("CRF", "22"),
+    "preset": os.getenv("PRESET", "veryfast"),
+    "audio_bitrate": os.getenv("AUDIO_BITRATE", "160k"),
+    "use_nvenc": os.getenv("USE_NVENC", "false").lower() == "true",
+    "keep_original": os.getenv("KEEP_ORIGINAL", "false").lower() == "true",
+    "preserve_timestamps": os.getenv("PRESERVE_TIMESTAMPS", "true").lower() == "true",
+    "dry_run": os.getenv("DRY_RUN", "false").lower() == "true",
+}
+EXTENSIONS = [
+    "avi","wmv","mov","mkv","flv","ts","m2ts","mts","m2t","mpg","mpeg","vob","mxf",
+    "webm","3gp","3g2","ogv","rm","rmvb","divx","xvid","f4v","m4v","mp4"
+]
 
-EXTENSIONS = ["avi","wmv","mov","mkv","flv","ts","m2ts","mts","m2t","mpg","mpeg","vob","mxf","webm","3gp","3g2","ogv","rm","rmvb","divx","xvid","f4v","m4v","mp4"]
+app = FastAPI(title="Universal Encoder", version="2.2.0")
+app.mount("/static", StaticFiles(directory=str(Path(__file__).parent/"static")), name="static")
 
-app = FastAPI(title="Transcoder Debug UI", version="1.6.1")
-app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
-
-
-class WSManager:
-    def __init__(self):
-        self.active: List[WebSocket] = []
-
-    async def connect(self, ws: WebSocket):
-        await ws.accept()
-        self.active.append(ws)
-
-    def disconnect(self, ws: WebSocket):
-        if ws in self.active:
-            self.active.remove(ws)
-
-    async def broadcast(self, msg: Dict[str, Any]):
-        stale = []
+# ---------- WebSocket bus ----------
+class WS:
+    def __init__(self): self.active:List[WebSocket] = []
+    async def connect(self,ws:WebSocket): await ws.accept(); self.active.append(ws)
+    def disconnect(self,ws:WebSocket): 
+        if ws in self.active: self.active.remove(ws)
+    async def send(self,msg:Dict[str,Any]):
         for ws in list(self.active):
-            try:
-                await ws.send_text(json.dumps(msg))
-            except Exception:
-                stale.append(ws)
-        for ws in stale:
-            self.disconnect(ws)
+            try: await ws.send_text(json.dumps(msg))
+            except Exception: self.disconnect(ws)
+ws = WS()
 
+# ---------- Runtime state ----------
+RUNNING=False; CANCEL=False
+QUEUE:List[str]=[]; QUEUE_LOCK=asyncio.Lock()
+CURRENT_PROCS:Dict[str,asyncio.subprocess.Process]={}   # keyed by normalized path
+ORIG_NAME:Dict[str,str]={}                               # normalized -> original path string
+PAUSED_SET:set[str]=set()
+OPTIONS={"continuous_scan": False, "scan_interval": 60, "concurrency": 1, "auto_start": True}
 
-ws_manager = WSManager()
-
-RUNNING = False
-CANCEL = False
-PRIORITY_RUNNING = False
-
-QUEUE: List[str] = []
-
-CURRENT_PROC: Optional[asyncio.subprocess.Process] = None
-CURRENT_FILE: Optional[str] = None
-PAUSED_PROC: Optional[asyncio.subprocess.Process] = None
-PAUSED_FILE: Optional[str] = None
-
-
-def log(message: str):
-    return {"type": "log", "ts": time.time(), "message": message}
-
-
-async def ws_log(message: str):
-    await ws_manager.broadcast(log(message))
-
-
-async def ffprobe_duration(path: str) -> Optional[float]:
-    proc = await asyncio.create_subprocess_exec(
-        "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "format=duration",
-        "-of", "default=nw=1:nk=1", path,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-    )
-    out, _ = await proc.communicate()
+# ---------- Helpers ----------
+def nkey(p:str)->str:
+    """Normalize for stable, case-insensitive, unicode-safe matching."""
     try:
-        val = float(out.decode().strip())
-        return val if val > 0 else None
+        rp = os.path.realpath(p)
+    except Exception:
+        rp = os.path.abspath(p)
+    return unicodedata.normalize("NFC", rp).casefold()
+
+async def wlog(m:str): await ws.send({"type":"log","ts":time.time(),"message":m})
+
+def proc_for(file_path:str)->Optional[asyncio.subprocess.Process]:
+    """Find running process by normalized full path, with basename fallback."""
+    k=nkey(file_path)
+    if k in CURRENT_PROCS: return CURRENT_PROCS[k]
+    b=unicodedata.normalize("NFC", Path(file_path).name).casefold()
+    for key,proc in CURRENT_PROCS.items():
+        if unicodedata.normalize("NFC", Path(ORIG_NAME.get(key,key)).name).casefold()==b:
+            return proc
+    return None
+
+def should_pick(p:Path)->bool:
+    return (not p.name.endswith(".transcoding.mp4")) and p.suffix.lower().lstrip(".") in EXTENSIONS
+
+async def ffprobe_duration(path:str)->Optional[float]:
+    proc=await asyncio.create_subprocess_exec(
+        "ffprobe","-v","error","-select_streams","v:0","-show_entries","format=duration",
+        "-of","default=nw=1:nk=1",path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    out,_=await proc.communicate()
+    try:
+        v=float(out.decode().strip())
+        return v if v>0 else None
     except Exception:
         return None
 
-
-async def ffprobe_codecs(path: str) -> Dict[str, Optional[str]]:
-    async def codec(stream: str):
-        proc = await asyncio.create_subprocess_exec(
-            "ffprobe", "-v", "error", "-select_streams", f"{stream}:0",
-            "-show_entries", "stream=codec_name", "-of", "csv=p=0", path,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+async def ffprobe_codecs(path:str)->Dict[str,Optional[str]]:
+    async def one(sel):
+        p=await asyncio.create_subprocess_exec(
+            "ffprobe","-v","error","-select_streams",f"{sel}:0","-show_entries","stream=codec_name",
+            "-of","csv=p=0",path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
-        out, _ = await proc.communicate()
-        t = out.decode().strip()
-        return t if t else None
+        out,_=await p.communicate()
+        t=out.decode().strip()
+        return t or None
+    return {"v":await one("v"), "a":await one("a")}
 
-    v = await codec("v")
-    a = await codec("a")
-    return {"v": v, "a": a}
-
-
-def build_ffmpeg_cmd(src: str, dst_tmp: str, transcode: bool) -> list[str]:
-    base = ["ffmpeg", "-nostdin", "-fflags", "+genpts", "-y", "-i", src]
+def build_ffmpeg_cmd(src:str, dst_tmp:str, transcode:bool)->list[str]:
+    base=["ffmpeg","-nostdin","-fflags","+genpts","-y","-i",src]
     if transcode:
-        common = [
-            "-vsync", "vfr", "-vf", "setpts=PTS-STARTPTS",
-            "-af", "aresample=async=1000:min_hard_comp=0.100:first_pts=0,asetpts=PTS-STARTPTS",
-            "-map", "0:v:0", "-map", "0:a?:0",
-        ]
-        if USE_NVENC:
-            video = ["-c:v", "h264_nvenc", "-preset", PRESET, "-rc", "vbr", "-cq", "23", "-pix_fmt", "yuv420p"]
+        common=["-vsync","vfr","-vf","setpts=PTS-STARTPTS",
+                "-af","aresample=async=1000:min_hard_comp=0.100:first_pts=0,asetpts=PTS-STARTPTS",
+                "-map","0:v:0","-map","0:a?:0"]
+        if RUNTIME["use_nvenc"]:
+            video=["-c:v","h264_nvenc","-preset",RUNTIME["preset"],"-rc","vbr","-cq","23","-pix_fmt","yuv420p"]
         else:
-            video = ["-c:v", "libx264", "-preset", PRESET, "-tune", "fastdecode", "-pix_fmt", "yuv420p", "-crf", CRF]
-        audio = ["-c:a", "aac", "-ar", "48000", "-b:a", AUDIO_BITRATE, "-ac", "2"]
-        tail = ["-movflags", "+faststart", "-avoid_negative_ts", "make_zero", "-progress", "pipe:1", dst_tmp]
-        return base + common + video + audio + tail
+            video=["-c:v","libx264","-preset",RUNTIME["preset"],"-tune","fastdecode","-pix_fmt","yuv420p","-crf",RUNTIME["crf"]]
+        audio=["-c:a","aac","-ar","48000","-b:a",RUNTIME["audio_bitrate"],"-ac","2"]
+        return base + common + video + audio + ["-movflags","+faststart","-avoid_negative_ts","make_zero","-progress","pipe:1",dst_tmp]
     else:
-        return base + ["-c", "copy", "-movflags", "+faststart", "-avoid_negative_ts", "make_zero", "-progress", "pipe:1", dst_tmp]
+        return base + ["-c","copy","-movflags","+faststart","-avoid_negative_ts","make_zero","-progress","pipe:1",dst_tmp]
 
-
-async def run_ffmpeg(src: str, dst_tmp: str, duration: Optional[float], transcode: bool):
-    global CURRENT_PROC
-    proc = await asyncio.create_subprocess_exec(
-        *build_ffmpeg_cmd(src, dst_tmp, transcode),
+async def run_ffmpeg(src:str, dst_tmp:str, duration:Optional[float], transcode:bool):
+    proc=await asyncio.create_subprocess_exec(
+        *build_ffmpeg_cmd(src,dst_tmp,transcode),
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=True
     )
-    CURRENT_PROC = proc
+    key=nkey(src); CURRENT_PROCS[key]=proc; ORIG_NAME[key]=src
 
-    async def read_stdout():
-        nonlocal duration
-        buf = {}
-        last_send = 0.0
+    async def read_out():
+        buf={}; last=0.0
         while True:
-            line = await proc.stdout.readline()
-            if not line:
-                break
-            s = line.decode(errors="ignore").strip()
+            line=await proc.stdout.readline()
+            if not line: break
+            s=line.decode(errors="ignore").strip()
             if "=" in s:
-                k, v = s.split("=", 1)
-                buf[k] = v
-                if k == "progress" and v in ("continue", "end"):
-                    out_ms = float(buf.get("out_time_ms", "0") or 0.0)
-                    speed = buf.get("speed", "")
-                    try:
-                        sfloat = float(speed.rstrip("x")) if speed.endswith("x") else None
-                    except Exception:
-                        sfloat = None
-                    percent, eta = None, None
-                    if duration and duration > 0:
-                        percent = min(99.9, (out_ms / 1e6) / duration * 100.0)
-                        if sfloat and sfloat > 0:
-                            remaining = max(0.0, duration - (out_ms / 1e6))
-                            eta = remaining / sfloat
-                    now = time.time()
-                    if now - last_send >= 0.2 or v == "end":
-                        await ws_manager.broadcast({
-                            "type": "progress", "file": src, "percent": percent,
-                            "speed": sfloat, "eta": eta, "stage": v
-                        })
-                        last_send = now
-                    if v == "end":
-                        break
+                k,v=s.split("=",1); buf[k]=v
+                if k=="progress" and v in ("continue","end"):
+                    out_ms=float(buf.get("out_time_ms","0") or 0.0)
+                    speed=buf.get("speed","")
+                    try: sfloat=float(speed.rstrip("x")) if speed.endswith("x") else None
+                    except Exception: sfloat=None
+                    percent=eta=None
+                    if duration and duration>0:
+                        percent=min(99.9,(out_ms/1e6)/duration*100.0)
+                        if sfloat and sfloat>0:
+                            eta=max(0.0,duration-(out_ms/1e6))/sfloat
+                    now=time.time()
+                    if now-last>=0.2 or v=="end":
+                        await ws.send({"type":"progress","file":ORIG_NAME.get(key,src),"percent":percent,"speed":sfloat,"eta":eta,"stage":v}); last=now
+                    if v=="end": break
 
-    async def read_stderr():
+    async def read_err():
         while True:
-            line = await proc.stderr.readline()
-            if not line:
-                break
-            await ws_manager.broadcast({"type": "log", "ts": time.time(), "message": line.decode(errors="ignore").rstrip()})
+            line=await proc.stderr.readline()
+            if not line: break
+            await wlog(line.decode(errors="ignore").rstrip())
 
-    await asyncio.gather(read_stdout(), read_stderr())
-    rc = await proc.wait()
-    CURRENT_PROC = None
+    await asyncio.gather(read_out(), read_err())
+    rc=await proc.wait()
+    CURRENT_PROCS.pop(key,None); ORIG_NAME.pop(key,None); PAUSED_SET.discard(key)
     return rc
 
+async def process_file(src:str):
+    p=Path(src)
+    if p.name.endswith(".transcoding.mp4"): return True
+    dst=str(p.with_suffix(".mp4")); tmp=str(p.with_name("."+p.stem+".transcoding.mp4"))
+    dur=await ffprobe_duration(src); c=await ffprobe_codecs(src)
+    trans=not (c.get("v")=="h264" and c.get("a")=="aac")
 
-async def process_file(src: str):
-    global CURRENT_FILE
-    CURRENT_FILE = src
-    p = Path(src)
-    if p.name.endswith(".transcoding.mp4"):
-        await ws_log(f"[skip] temp file: {src}")
-        CURRENT_FILE = None
-        return True
+    await ws.send({"type":"queue_pop","file":src})
+    await wlog(f"Processing: {src} (duration={dur if dur else 'unknown'}s) transcode={trans}")
+    if RUNTIME["dry_run"]: await wlog(f"[DRY_RUN] Would {'transcode' if trans else 'remux'} -> {dst}"); return True
 
-    dst = str(p.with_suffix(".mp4"))
-    dst_tmp = str(p.with_name("." + p.stem + ".transcoding.mp4"))
-    dur = await ffprobe_duration(src)
-    codecs = await ffprobe_codecs(src)
-    transcode = not (codecs.get("v") == "h264" and codecs.get("a") == "aac")
-
-    await ws_manager.broadcast({"type": "queue_pop", "file": src})
-    await ws_log(f"Processing: {src} (duration={dur if dur else 'unknown'}s) transcode={transcode}")
-    if DRY_RUN:
-        await ws_log(f"[DRY_RUN] Would {'transcode' if transcode else 'remux'} -> {dst}")
-        CURRENT_FILE = None
-        return True
-
-    rc = await run_ffmpeg(src, dst_tmp, dur, transcode)
-    ok = (rc == 0)
-    if ok:
-        if PRESERVE_TIMESTAMPS:
-            try:
-                os.utime(dst_tmp, (os.path.getatime(src), os.path.getmtime(src)))
-            except Exception:
-                pass
-        os.replace(dst_tmp, dst)
-        if not KEEP_ORIGINAL and os.path.abspath(dst) != os.path.abspath(src):
-            try:
-                os.remove(src)
-            except Exception as e:
-                await ws_log(f"[warn] Could not remove original: {e}")
-        await ws_log(f"[ok] {src} -> {dst}")
-        await ws_manager.broadcast({"type": "done", "file": src, "ok": True})
+    rc=await run_ffmpeg(src,tmp,dur,trans)
+    if rc==0:
+        if RUNTIME["preserve_timestamps"]:
+            try: os.utime(tmp,(os.path.getatime(src),os.path.getmtime(src)))
+            except Exception: pass
+        os.replace(tmp,dst)
+        if not RUNTIME["keep_original"] and os.path.abspath(dst)!=os.path.abspath(src):
+            try: os.remove(src)
+            except Exception as e: await wlog(f"[warn] Could not remove original: {e}")
+        await wlog(f"[ok] {src} -> {dst}"); await ws.send({"type":"done","file":src,"ok":True})
     else:
-        try:
-            if os.path.exists(dst_tmp):
-                os.remove(dst_tmp)
-        except Exception:
-            pass
-        await ws_log(f"[error] ffmpeg rc={rc} for {src}")
-        await ws_manager.broadcast({"type": "done", "file": src, "ok": False})
-    CURRENT_FILE = None
-    return ok
+        try: 
+            if os.path.exists(tmp): os.remove(tmp)
+        except Exception: pass
+        await wlog(f"[error] ffmpeg rc={rc} for {src}"); await ws.send({"type":"done","file":src,"ok":False})
+    return rc==0
 
-
-def should_pick(path: Path) -> bool:
-    n = path.name
-    if n.endswith(".transcoding.mp4"):
-        return False
-    return path.suffix.lower().lstrip(".") in EXTENSIONS
-
-
-async def scan_only(root: str) -> None:
-    global QUEUE
-    QUEUE = []
-    await ws_manager.broadcast({"type": "queue_reset"})
-    batch = []
-    BATCH = 200
-    for dirpath, _, filenames in os.walk(root):
-        for name in filenames:
-            p = Path(dirpath) / name
-            if should_pick(p):
-                fp = str(p)
-                QUEUE.append(fp)
-                batch.append({"file": fp, "dir": str(p.parent)})
-                if len(batch) >= BATCH:
-                    await ws_manager.broadcast({"type": "queue_append", "items": batch, "total": len(QUEUE)})
-                    batch = []
-    if batch:
-        await ws_manager.broadcast({"type": "queue_append", "items": batch, "total": len(QUEUE)})
-    await ws_log(f"Queued {len(QUEUE)} files under {root} (scan only)")
-
-
-async def worker_loop():
-    global RUNNING, CANCEL
-    RUNNING = True
-    CANCEL = False
-    try:
-        while not CANCEL and QUEUE:
-            f = QUEUE.pop(0)
-            await process_file(f)
-        await ws_log("Stopped or queue is empty.")
-    finally:
-        RUNNING = False
-
-
+# ---------- REST ----------
 @app.get("/")
-async def index():
-    return FileResponse(Path(__file__).parent / "static" / "index.html")
-
+async def index(): return FileResponse(Path(__file__).parent/"static"/"index.html")
 
 @app.get("/config")
 async def get_config():
-    return {
-        "target_dir": TARGET_DIR,
-        "crf": CRF,
-        "preset": PRESET,
-        "audio_bitrate": AUDIO_BITRATE,
-        "use_nvenc": USE_NVENC,
-        "keep_original": KEEP_ORIGINAL,
-        "preserve_timestamps": PRESERVE_TIMESTAMPS,
-        "dry_run": DRY_RUN,
-        "running": RUNNING,
-        "queue_len": len(QUEUE),
-        "current": CURRENT_FILE,
-    }
+    async with QUEUE_LOCK: qlen=len(QUEUE)
+    return {"target_dir": TARGET_DIR, "running": RUNNING, "queue_len": qlen, "options": OPTIONS, "xcode": RUNTIME}
 
+@app.get("/options")
+async def options_get(): return OPTIONS
+
+@app.post("/options")
+async def options_set(payload:Dict[str,Any]=Body(...)):
+    loop = asyncio.get_event_loop()
+    changed=False
+    if "continuous_scan" in payload: OPTIONS["continuous_scan"]=bool(payload["continuous_scan"]); changed=True
+    if "scan_interval" in payload:
+        try: OPTIONS["scan_interval"]=max(5,int(payload["scan_interval"])); changed=True
+        except Exception: pass
+    if "concurrency" in payload:
+        try: OPTIONS["concurrency"]=max(1,min(8,int(payload["concurrency"]))); changed=True
+        except Exception: pass
+    if "auto_start" in payload: OPTIONS["auto_start"]=bool(payload["auto_start"]); changed=True
+    if changed: await ws.send({"type":"options","options":OPTIONS})
+    return {"status":"ok","options":OPTIONS}
 
 @app.get("/queue")
-async def get_queue(limit: int = Query(500, ge=1, le=5000)):
-    items = [{"file": f, "dir": str(Path(f).parent)} for f in QUEUE[:limit]]
-    return {"total": len(QUEUE), "items": items}
-
+async def get_queue():
+    async with QUEUE_LOCK: items=[{"file":f,"dir":str(Path(f).parent)} for f in QUEUE]; total=len(QUEUE)
+    return {"total":total,"items":items}
 
 @app.post("/scan")
 async def api_scan():
-    await scan_only(TARGET_DIR)
-    return {"status": "scanned", "total": len(QUEUE)}
+    global QUEUE
+    async with QUEUE_LOCK: QUEUE=[]
+    await ws.send({"type":"queue_reset"})
+    running_keys=set(CURRENT_PROCS.keys())|set(PAUSED_SET)
+    added=[]
+    for d,_,files in os.walk(TARGET_DIR):
+        for name in files:
+            p=Path(d)/name
+            if not should_pick(p): continue
+            k=nkey(str(p))
+            if k in running_keys: continue
+            async with QUEUE_LOCK: QUEUE.append(str(p))
+            added.append({"file":str(p),"dir":str(p.parent)})
+    if added: await ws.send({"type":"queue_append","items":added,"total":len(QUEUE)})
+    await wlog(f"Queued {len(QUEUE)} files under {TARGET_DIR} (scan only)")
+    return {"status":"ok","queued":len(QUEUE)}
 
+async def pop_next()->Optional[str]:
+    async with QUEUE_LOCK:
+        if QUEUE: return QUEUE.pop(0)
+        return None
+
+WORKERS:List[asyncio.Task]=[]
+async def worker(i:int):
+    await wlog(f"[worker {i}] started")
+    try:
+        while not CANCEL:
+            f=await pop_next()
+            if not f: break
+            await process_file(f)
+    finally:
+        await wlog(f"[worker {i}] stopped")
 
 @app.post("/start")
-async def api_start():
-    global RUNNING
-    if RUNNING:
-        return JSONResponse({"status": "already-running"})
-    if not QUEUE:
-        return JSONResponse({"status": "empty"}, status_code=400)
-    asyncio.create_task(worker_loop())
-    return {"status": "started"}
-
+async def start_pool():
+    global RUNNING,CANCEL,WORKERS
+    if RUNNING: return {"status":"already-running"}
+    async with QUEUE_LOCK:
+        if not QUEUE: return {"status":"empty"}
+    RUNNING=True; CANCEL=False; WORKERS=[]
+    n=max(1,min(8,int(OPTIONS.get("concurrency",1))))
+    for i in range(n): WORKERS.append(asyncio.create_task(worker(i+1)))
+    async def waiter():
+        global RUNNING,WORKERS
+        await asyncio.gather(*WORKERS,return_exceptions=True)
+        RUNNING=False; WORKERS=[]
+        await wlog("Worker pool finished.")
+    asyncio.create_task(waiter())
+    return {"status":"started","workers":n}
 
 @app.post("/stop")
-async def api_stop():
-    global CANCEL, CURRENT_PROC, CURRENT_FILE, PAUSED_PROC, PAUSED_FILE
-    CANCEL = True
-    await ws_log("Stop requested: halting current job and leaving queue intact.")
-    await ws_manager.broadcast({"type": "stopping", "file": CURRENT_FILE})
-
-    if CURRENT_FILE and (CURRENT_FILE not in QUEUE):
-        QUEUE.insert(0, CURRENT_FILE)
-    if PAUSED_FILE and (PAUSED_FILE not in QUEUE):
-        QUEUE.insert(0, PAUSED_FILE)
-
-    for proc in (CURRENT_PROC, PAUSED_PROC):
-        if proc and (proc.returncode is None):
-            try: os.killpg(proc.pid, signal.SIGINT)
+async def stop_pool():
+    global CANCEL,RUNNING
+    CANCEL=True
+    # return paused/running to queue front
+    for key in list(PAUSED_SET)+list(CURRENT_PROCS.keys()):
+        f=ORIG_NAME.get(key,key)
+        async with QUEUE_LOCK:
+            if f not in QUEUE: QUEUE.insert(0,f)
+    for key,proc in list(CURRENT_PROCS.items()):
+        try:
+            pgid=os.getpgid(proc.pid)
+        except Exception:
+            pgid=None
+        for sig in (signal.SIGINT,signal.SIGTERM,signal.SIGKILL):
+            try:
+                if pgid is not None: os.killpg(pgid,sig)
+                os.kill(proc.pid,sig)
             except Exception: pass
-            await asyncio.sleep(0.5)
-            if proc.returncode is None:
-                try: os.killpg(proc.pid, signal.SIGTERM)
-                except Exception: pass
-            await asyncio.sleep(0.8)
-            if proc.returncode is None:
-                try: os.killpg(proc.pid, signal.SIGKILL)
-                except Exception: pass
+            await asyncio.sleep(0.25)
+            if proc.returncode is not None: break
+    RUNNING=False
+    await ws.send({"type":"jobs_clear"})
+    return {"status":"stopping"}
 
-    PAUSED_PROC = None
-    PAUSED_FILE = None
-    return {"status": "stopping"}
+@app.get("/state")
+async def state():
+    return {"running_files":[ORIG_NAME.get(k,k) for k in CURRENT_PROCS.keys()],
+            "paused":[ORIG_NAME.get(k,k) for k in PAUSED_SET], "queue_len": len(QUEUE)}
 
+@app.post("/job/toggle")
+async def toggle(payload:Dict[str,str]=Body(...)):
+    f=payload.get("file")
+    if not f: return JSONResponse({"error":"missing file"},status_code=400)
+    proc=proc_for(f)
+    if not proc or (proc.returncode is not None):
+        return JSONResponse({"error":"not-running"},status_code=404)
+    key=nkey(f)
+    try: pgid=os.getpgid(proc.pid)
+    except Exception: pgid=None
+    if key in PAUSED_SET:
+        if pgid is not None:
+            try: os.killpg(pgid, signal.SIGCONT)
+            except Exception: pass
+        try: os.kill(proc.pid, signal.SIGCONT)
+        except Exception: pass
+        await asyncio.sleep(0.05)
+        PAUSED_SET.discard(key)
+        await ws.send({"type":"resumed","file":ORIG_NAME.get(key,f)})
+        await wlog(f"[job] Resumed: {ORIG_NAME.get(key,f)}")
+        return {"status":"resumed"}
+    else:
+        if pgid is not None:
+            try: os.killpg(pgid, signal.SIGSTOP)
+            except Exception: pass
+        try: os.kill(proc.pid, signal.SIGSTOP)
+        except Exception: pass
+        PAUSED_SET.add(key)
+        await ws.send({"type":"paused","file":ORIG_NAME.get(key,f)})
+        await wlog(f"[job] Paused: {ORIG_NAME.get(key,f)}")
+        return {"status":"paused"}
+
+@app.post("/job/stop")
+async def job_stop(payload:Dict[str,Any]=Body(...)):
+    f=payload.get("file")
+    if not f: return JSONResponse({"error":"missing file"},status_code=400)
+    proc=proc_for(f)
+    if not proc or (proc.returncode is not None):
+        return JSONResponse({"error":"not-running"},status_code=404)
+    try: pgid=os.getpgid(proc.pid)
+    except Exception: pgid=None
+    await ws.send({"type":"stopping","file":f})
+    for sig in (signal.SIGINT,signal.SIGTERM,signal.SIGKILL):
+        try:
+            if pgid is not None: os.killpg(pgid,sig)
+            os.kill(proc.pid,sig)
+        except Exception: pass
+        await asyncio.sleep(0.3)
+        if proc.returncode is not None: break
+    await ws.send({"type":"job_stopped","file":f})
+    return {"status":"stopped"}
 
 @app.post("/queue/top")
-async def queue_top(payload: Dict[str, str] = Body(...)):
-    file = payload.get("file")
-    if not file:
-        return JSONResponse({"error": "missing file"}, status_code=400)
-    try:
-        idx = QUEUE.index(file)
-    except ValueError:
-        return JSONResponse({"error": "file not in queue"}, status_code=404)
-    QUEUE.pop(idx)
-    QUEUE.insert(0, file)
-    await ws_manager.broadcast({"type": "queue_move", "file": file, "to": 0})
-    await ws_log(f"[queue] Moved to top: {file}")
-    return {"status": "ok"}
-
+async def queue_top(payload:Dict[str,str]=Body(...)):
+    f=payload.get("file")
+    if not f: return {"status":"ok"}
+    async with QUEUE_LOCK:
+        if f in QUEUE:
+            QUEUE.remove(f); QUEUE.insert(0,f)
+    await ws.send({"type":"queue_move","file":f,"to":0})
+    return {"status":"ok"}
 
 @app.post("/transcode_now")
-async def transcode_now(payload: Dict[str, str] = Body(...)):
-    global PRIORITY_RUNNING, PAUSED_PROC, PAUSED_FILE
-    file = payload.get("file")
-    if not file:
-        return JSONResponse({"error": "missing file"}, status_code=400)
+async def transcode_now(payload:Dict[str,str]=Body(...)):
+    f=payload.get("file")
+    if not f: return {"status":"ok"}
+    async with QUEUE_LOCK:
+        if f in QUEUE: QUEUE.remove(f)
+    await ws.send({"type":"queue_pop","file":f})
+    asyncio.create_task(process_file(f))
+    return {"status":"queued-or-started"}
 
-    if CURRENT_FILE and os.path.abspath(CURRENT_FILE) == os.path.abspath(file):
-        return {"status": "already-current"}
-
-    try:
-        idx = QUEUE.index(file)
-        QUEUE.pop(idx)
-        await ws_manager.broadcast({"type": "queue_pop", "file": file})
-    except ValueError:
-        pass
-
-    if PRIORITY_RUNNING:
-        return JSONResponse({"status": "busy", "message": "priority job running"}, status_code=409)
-
-    PRIORITY_RUNNING = True
-    await ws_log(f"[priority] NOW: {file}")
-
-    async def do_now():
-        nonlocal file
-        global PRIORITY_RUNNING, PAUSED_PROC, PAUSED_FILE
-        if CURRENT_PROC and (CURRENT_PROC.returncode is None):
-            try:
-                CURRENT_PROC.send_signal(signal.SIGSTOP)
-                PAUSED_PROC = CURRENT_PROC
-                PAUSED_FILE = CURRENT_FILE
-                await ws_manager.broadcast({"type": "paused", "file": PAUSED_FILE})
-                await ws_log(f"[priority] Paused current: {PAUSED_FILE}")
-            except ProcessLookupError:
-                PAUSED_PROC = None
-                PAUSED_FILE = None
-
-        await process_file(file)
-
-        if PAUSED_PROC and (PAUSED_PROC.returncode is None):
-            try:
-                PAUSED_PROC.send_signal(signal.SIGCONT)
-                await ws_manager.broadcast({"type": "resumed", "file": PAUSED_FILE})
-                await ws_log(f"[priority] Resumed: {PAUSED_FILE}")
-            except ProcessLookupError:
-                await ws_log("[priority] Paused process already exited.")
-        PAUSED_PROC = None
-        PAUSED_FILE = None
-        PRIORITY_RUNNING = False
-
-    asyncio.create_task(do_now())
-    return {"status": "started"}
-
-
+# ---------- WebSocket ----------
 @app.websocket("/ws")
-async def ws(ws: WebSocket):
-    await ws_manager.connect(ws)
+async def websocket(ws_conn:WebSocket):
+    await ws.connect(ws_conn)
     try:
-        await ws.send_text(json.dumps({"type": "hello", "message": "connected"}))
+        await ws_conn.send_text(json.dumps({"type":"hello","message":"connected"}))
         while True:
-            _ = await ws.receive_text()
+            _ = await ws_conn.receive_text()
     except WebSocketDisconnect:
-        ws_manager.disconnect(ws)
+        ws.disconnect(ws_conn)

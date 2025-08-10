@@ -3,18 +3,20 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Transcoder Debug UI</title>
+  <title>Universal Encoder</title>
   <style>
-    :root { --bg:#0f172a; --panel:#fff; --muted:#6b7280; --accent:#2563eb; --danger:#ef4444; --ok:#16a34a; }
+    :root { --bg:#0b1224; --panel:#fff; --muted:#6b7280; --accent:#2563eb; --danger:#ef4444; --ok:#16a34a; }
+    html, body { height: 100%; }
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, 'Helvetica Neue', Arial, Noto Sans; margin: 0; color: #111; }
-    header { background: var(--bg); color: #fff; padding: 14px 18px; display: flex; align-items: center; gap: 14px;}
+    header { position: sticky; top: 0; z-index: 1000; background: var(--bg); color: #fff; padding: 10px 14px; display: flex; align-items: center; gap: 14px; border-bottom: 1px solid rgba(255,255,255,.06); }
     header h1 { margin: 0; font-size: 18px; }
     main { display: grid; grid-template-columns: 420px 1fr; gap: 16px; padding: 16px; }
     .panel { background: var(--panel); border: 1px solid #e5e7eb; border-radius: 12px; padding: 12px; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
     button { background: var(--accent); color: #fff; border: none; padding: 6px 10px; border-radius: 8px; cursor:pointer; }
     button:disabled { opacity: .6; cursor: not-allowed; }
+    .btn-secondary { background:#475569; }
     .muted { color: var(--muted); font-size: 12px; }
-    .log { font-family: ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; background: #0b1020; color:#e5e7eb; height: 42vh; overflow:auto; padding:10px; border-radius:10px; }
+    .log { font-family: ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; background: #0b1020; color:#e5e7eb; height: 65vh; overflow:auto; padding:10px; border-radius:10px; resize: both; min-width: 300px; min-height: 220px; }
     .job { border-bottom: 1px dashed #e5e7eb; padding: 8px 0; }
     .name { font-weight: 600; font-size: 14px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .row { display:flex; align-items:center; justify-content:space-between; gap:10px; }
@@ -23,26 +25,60 @@
     .tiny { font-size: 12px; color: #374151; }
     .grid { display:grid; gap:10px; }
     .stack { display:grid; gap:16px; }
-    /* Queue */
-    .queue { height: 42vh; overflow:auto; border: 1px dashed #e5e7eb; border-radius: 10px; padding: 8px; background:#fafafa; }
-    .qitem { padding: 6px 6px; border-bottom: 1px solid #eee; display:grid; grid-template-columns: 1fr auto; gap: 8px; align-items:center; }
-    .qfile { font-weight: 600; font-size: 13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .queue { height: 28vh; overflow:auto; border: 1px dashed #e5e7eb; border-radius: 10px; padding: 8px; background:#fafafa; }
+    .qitem { position: relative; padding: 6px 6px; border-bottom: 1px solid #eee; display:grid; grid-template-columns: 1fr auto; gap: 8px; align-items:center; }
+    .qfile { font-weight: 600; font-size: 13px; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; word-break: break-word; overflow-wrap: anywhere; }
     .qdir { font-size: 12px; color:#6b7280; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .qbtns { display:flex; gap:6px; }
+    .qbtns { display:flex; gap:6px; align-items:center; }
     .btn-now { background:#16a34a; }
     .btn-top { background:#0ea5e9; }
+    .job-actions { display:flex; gap:8px; }
+    .btn-pause { background:#475569; }
+    .btn-resume { background:#16a34a; }
+    .btn-kill { background:#ef4444; }
+    .stopping { opacity: .6; }
+    /* Settings drawer */
+    .drawer { position: fixed; top:0; right:-420px; width: 380px; height: 100%; background:#ffffff; box-shadow: -4px 0 16px rgba(0,0,0,.15); border-left:1px solid #e5e7eb; transition: right .2s ease; z-index:2000; display:flex; flex-direction:column; }
+    .drawer.open { right:0; }
+    .drawer header { background:#0b1224; color:#fff; padding:12px 14px; border-bottom:1px solid rgba(255,255,255,.08); }
+    .drawer .body { padding:14px; display:grid; gap:12px; overflow:auto; }
+    .line { display:flex; align-items:center; justify-content:space-between; gap:10px; }
   </style>
 </head>
 <body>
   <header>
-    <h1>Transcoder Debug UI</h1>
+    <h1>Universal Encoder</h1>
     <div id="cfg" class="muted"></div>
-    <div style="margin-left:auto; display:flex; gap:10px">
+    <div style="margin-left:auto; display:flex; gap:10px; align-items:center">
+      <div class="muted" title="Continuously scan for new files">Auto-scan</div>
+      <label class="switch">
+        <input type="checkbox" id="autoScan">
+        <span class="slider"></span>
+      </label>
+      <select id="scanInterval" title="Scan interval">
+        <option value="60">1 min</option>
+        <option value="600">10 min</option>
+        <option value="3600">1 h</option>
+        <option value="86400">Daily</option>
+      </select>
+      <div class="muted">Workers</div>
+      <select id="workers">
+        <option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option>
+      </select>
+      <button id="settingsBtn" class="btn-secondary">Settings</button>
       <button id="scanBtn">Scan</button>
       <button id="startBtn" style="background: var(--ok)">Start</button>
       <button id="stopBtn" style="background:var(--danger)">Stop</button>
     </div>
+    <style>
+      .switch { position: relative; display: inline-block; width: 46px; height: 26px; }
+      .switch input { display:none; }
+      .slider { position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background:#64748b; transition:.2s; border-radius: 999px; }
+      .slider:before { position:absolute; content:""; height:20px; width:20px; left:3px; bottom:3px; background:white; transition:.2s; border-radius:999px; }
+      input:checked + .slider { background:#22c55e; } input:checked + .slider:before { transform: translateX(20px); }
+    </style>
   </header>
+
   <main>
     <section class="stack">
       <section class="panel">
@@ -59,15 +95,89 @@
       <div id="log" class="log"></div>
     </section>
   </main>
+
+  <!-- Settings Drawer -->
+  <aside id="drawer" class="drawer" aria-hidden="true">
+    <header><strong>Transcoding Settings</strong></header>
+    <div class="body">
+      <div class="line"><label>CRF</label><input type="number" id="crf" min="12" max="30" step="1" /></div>
+      <div class="line"><label>Preset</label>
+        <select id="preset">
+          <option>ultrafast</option><option>superfast</option><option>veryfast</option>
+          <option>faster</option><option>fast</option><option>medium</option>
+          <option>slow</option><option>slower</option><option>veryslow</option>
+        </select>
+      </div>
+      <div class="line"><label>Audio bitrate</label>
+        <select id="ab">
+          <option>96k</option><option>128k</option><option selected>160k</option><option>192k</option><option>256k</option>
+        </select>
+      </div>
+      <div class="line"><label>Use NVENC</label><input type="checkbox" id="nvenc"/></div>
+      <div class="line"><label>Keep original</label><input type="checkbox" id="keep"/></div>
+      <div class="line"><label>Preserve timestamps</label><input type="checkbox" id="pt"/></div>
+      <div class="line"><label>Dry-run (no writing)</label><input type="checkbox" id="dry"/></div>
+      <div style="display:flex; gap:10px; margin-top:6px;">
+        <button id="saveX" style="background:#16a34a;">Save</button>
+        <button id="closeX" class="btn-secondary">Close</button>
+      </div>
+      <div class="muted">Changes apply to next jobs.</div>
+    </div>
+  </aside>
+
   <script>
     const logEl = document.getElementById('log');
     const jobsEl = document.getElementById('jobs');
     const scanBtn = document.getElementById('scanBtn');
     const startBtn = document.getElementById('startBtn');
     const stopBtn = document.getElementById('stopBtn');
+    const settingsBtn = document.getElementById('settingsBtn');
+    const drawer = document.getElementById('drawer');
     const cfgEl = document.getElementById('cfg');
     const qEl = document.getElementById('queue');
     const qCountEl = document.getElementById('qcount');
+    const autoScanEl = document.getElementById('autoScan');
+    const intervalEl = document.getElementById('scanInterval');
+    const workersEl = document.getElementById('workers');
+
+    // Drawer elements
+    const crfEl = document.getElementById('crf');
+    const presetEl = document.getElementById('preset');
+    const abEl = document.getElementById('ab');
+    const nvencEl = document.getElementById('nvenc');
+    const keepEl = document.getElementById('keep');
+    const ptEl = document.getElementById('pt');
+    const dryEl = document.getElementById('dry');
+    const saveX = document.getElementById('saveX');
+    const closeX = document.getElementById('closeX');
+
+    function openDrawer(){ drawer.classList.add('open'); drawer.setAttribute('aria-hidden','false'); }
+    function closeDrawer(){ drawer.classList.remove('open'); drawer.setAttribute('aria-hidden','true'); }
+
+    settingsBtn.onclick = async ()=>{
+      const cfg = await (await fetch('/config')).json();
+      const x = cfg.xcode || {};
+      crfEl.value = x.crf || '22';
+      presetEl.value = x.preset || 'veryfast';
+      abEl.value = x.audio_bitrate || '160k';
+      nvencEl.checked = !!x.use_nvenc;
+      keepEl.checked = !!x.keep_original;
+      ptEl.checked = !!x.preserve_timestamps;
+      dryEl.checked = !!x.dry_run;
+      openDrawer();
+    };
+    closeX.onclick = closeDrawer;
+    saveX.onclick = async ()=>{
+      const payload = {
+        crf: crfEl.value, preset: presetEl.value, audio_bitrate: abEl.value,
+        use_nvenc: nvencEl.checked, keep_original: keepEl.checked,
+        preserve_timestamps: ptEl.checked, dry_run: dryEl.checked
+      };
+      await fetch('/transcode_options',{method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+      closeDrawer();
+      appendLog('[settings] Saved transcoding options (applies to next jobs).');
+      await loadCfg();
+    };
 
     function humanTime(s){
       if(s == null || !isFinite(s)) return '—';
@@ -77,8 +187,6 @@
     }
 
     const jobs = new Map();
-    const qMap = new Map(); // file -> element
-
     function ensureJob(file){
       if(!jobs.has(file)){
         const row = document.createElement('div');
@@ -87,14 +195,38 @@
           <div class="name" title="${file}">${file}</div>
           <div class="row">
             <div class="bar"><div></div></div>
-            <div class="tiny"><span class="pct">0%</span> • <span class="spd">—</span> • ETA <span class="eta">—</span></div>
+            <div class="tiny">
+              <span class="pct">0%</span> • <span class="spd">—</span> • ETA <span class="eta">—</span>
+            </div>
+          </div>
+          <div class="job-actions">
+            <button class="btn-pause">Pause</button>
+            <button class="btn-kill">Stop</button>
           </div>`;
+        const pauseBtn = row.querySelector('.btn-pause');
+        const stopBtn = row.querySelector('.btn-kill');
+        pauseBtn.onclick = async ()=>{
+          await fetch('/job/toggle',{method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({file})});
+        };
+        stopBtn.onclick = async ()=>{
+          stopBtn.disabled = true;
+          row.classList.add('stopping');
+          await fetch('/job/stop',{method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({file, requeue:true})});
+          setTimeout(()=>{ stopBtn.disabled=false; }, 1200);
+        };
         jobsEl.appendChild(row);
         jobs.set(file, row);
       }
       return jobs.get(file);
     }
-
+    function removeJob(file){ const row = jobs.get(file); if(row){ row.remove(); jobs.delete(file); } }
+    function setPausedUI(file, paused){
+      const row = ensureJob(file);
+      const pb = row.querySelector('.btn-pause');
+      if(paused){ pb.textContent = 'Resume'; pb.className = 'btn-resume'; }
+      else { pb.textContent = 'Pause'; pb.className = 'btn-pause'; }
+    }
+    function clearJobs(){ jobsEl.innerHTML = ''; jobs.clear(); }
     function updateJob(msg){
       const row = ensureJob(msg.file);
       const bar = row.querySelector('.bar > div');
@@ -109,14 +241,13 @@
       if(msg.stage === 'end'){ pct.textContent = '100%'; bar.style.width = '100%'; }
     }
 
+    const qMap = new Map();
     async function api(path, body){
       const res = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{})});
       return res.json().catch(()=>({}));
     }
-
     function makeQItem(it){
-      const el = document.createElement('div');
-      el.className = 'qitem';
+      const el = document.createElement('div'); el.className = 'qitem';
       el.innerHTML = `
         <div>
           <div class="qfile" title="${it.file}">${it.file}</div>
@@ -125,18 +256,11 @@
         <div class="qbtns">
           <button class="btn-top">Top</button>
           <button class="btn-now">Now</button>
-        </div>
-      `;
-      el.querySelector('.btn-top').onclick = async ()=>{
-        await api('/queue/top', {file: it.file});
-      };
-      el.querySelector('.btn-now').onclick = async ()=>{
-        appendLog('Priority: ' + it.file);
-        await api('/transcode_now', {file: it.file});
-      };
+        </div>`;
+      el.querySelector('.btn-top').onclick = async ()=>{ await api('/queue/top', {file: it.file}); };
+      el.querySelector('.btn-now').onclick = async ()=>{ await api('/transcode_now', {file: it.file}); };
       return el;
     }
-
     function qAppend(items, total){
       for(const it of items){
         if(qMap.has(it.file)) continue;
@@ -147,76 +271,45 @@
       if(total !== undefined) qCountEl.textContent = `(${total} items)`;
       else qCountEl.textContent = `(${qMap.size} items)`;
     }
-
-    function qReset(){
-      qEl.innerHTML = '';
-      qMap.clear();
-      qCountEl.textContent = '';
-    }
-
-    function qPop(file){
-      const el = qMap.get(file);
-      if(el){
-        el.remove();
-        qMap.delete(file);
-        qCountEl.textContent = `(${qMap.size} items)`;
-      }
-    }
-
+    function qReset(){ qEl.innerHTML = ''; qMap.clear(); qCountEl.textContent=''; }
+    function qPop(file){ const el = qMap.get(file); if(el){ el.remove(); qMap.delete(file); qCountEl.textContent = `(${qMap.size} items)`; } }
     function qMove(file, toIndex){
-      const el = qMap.get(file);
-      if(!el) return;
+      const el = qMap.get(file); if(!el) return;
       qEl.removeChild(el);
       const children = Array.from(qEl.children);
-      if(toIndex >= children.length){
-        qEl.appendChild(el);
-      } else {
-        qEl.insertBefore(el, children[toIndex]);
-      }
+      if(toIndex >= children.length) qEl.appendChild(el); else qEl.insertBefore(el, children[toIndex]);
     }
-
     function appendLog(text){
       const atBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 30;
       const time = new Date().toLocaleTimeString();
-      logEl.textContent += `[${time}] ${text}
-`;
+      logEl.textContent += `[${time}] ${text}\n`;
       if(atBottom){ logEl.scrollTop = logEl.scrollHeight; }
     }
-
     async function loadCfg(){
       const res = await fetch('/config'); const cfg = await res.json();
-      cfgEl.textContent = `${cfg.target_dir} • CRF ${cfg.crf} • ${cfg.use_nvenc? 'NVENC':'x264'} • ${cfg.audio_bitrate} • queue ${cfg.queue_len} • ${cfg.running? 'running':'idle'}`;
+      const x = cfg.xcode || {};
+      cfgEl.textContent = `${cfg.target_dir} • CRF ${x.crf||'22'} • ${(x.use_nvenc? 'NVENC':'x264')} • ${x.audio_bitrate||'160k'} • queue ${cfg.queue_len} • ${cfg.running? 'running':'idle'}`;
+      if(cfg.options){
+        autoScanEl.checked = !!cfg.options.continuous_scan;
+        const iv = Number(cfg.options.scan_interval||60);
+        if([60,600,3600,86400].includes(iv)) intervalEl.value = String(iv);
+        const cc = Number(cfg.options.concurrency||1);
+        if([1,2,3,4].includes(cc)) workersEl.value = String(cc);
+      }
     }
     async function loadQueue(){
-      const res = await fetch('/queue');
-      const data = await res.json();
-      qReset();
-      qAppend(data.items, data.total);
+      const res = await fetch('/queue'); const data = await res.json();
+      qReset(); qAppend(data.items, data.total);
     }
 
-    scanBtn.onclick = async ()=>{
-      scanBtn.disabled = true;
-      await fetch('/scan',{method:'POST'});
-      await loadCfg();
-      await loadQueue();
-      setTimeout(()=>scanBtn.disabled=false, 500);
-    };
-    startBtn.onclick = async ()=>{
-      startBtn.disabled = true;
-      await fetch('/start',{method:'POST'});
-      await loadCfg();
-      setTimeout(()=>startBtn.disabled=false, 800);
-    };
-    stopBtn.onclick = async ()=>{
-      stopBtn.disabled = true;
-      const old = stopBtn.textContent;
-      stopBtn.textContent = 'Stopping...';
-      await fetch('/stop',{method:'POST'});
-      setTimeout(()=>{ stopBtn.disabled=false; stopBtn.textContent = old; }, 1200);
-    };
+    scanBtn.onclick = async ()=>{ scanBtn.disabled=true; await fetch('/scan',{method:'POST'}); await loadCfg(); await loadQueue(); setTimeout(()=>scanBtn.disabled=false,500); };
+    startBtn.onclick = async ()=>{ startBtn.disabled=true; await fetch('/start',{method:'POST'}); await loadCfg(); setTimeout(()=>startBtn.disabled=false,800); };
+    stopBtn.onclick = async ()=>{ stopBtn.disabled = true; const old = stopBtn.textContent; stopBtn.textContent = 'Stopping...'; await fetch('/stop',{method:'POST'}); setTimeout(()=>{ stopBtn.disabled=false; stopBtn.textContent=old; }, 900); };
+    autoScanEl.onchange = async ()=>{ const val = autoScanEl.checked; await api('/options', {continuous_scan: val, scan_interval: Number(intervalEl.value)}); appendLog(`Auto-scan ${val ? 'enabled' : 'disabled'} (every ${intervalEl.options[intervalEl.selectedIndex].text}).`); };
+    intervalEl.onchange = async ()=>{ await api('/options', {scan_interval: Number(intervalEl.value)}); appendLog(`Scan interval set to ${intervalEl.options[intervalEl.selectedIndex].text}.`); };
+    workersEl.onchange = async ()=>{ const r = await api('/options', {concurrency: Number(workersEl.value)}); appendLog(`Workers set to ${workersEl.value}.`); };
 
-    loadCfg();
-    loadQueue();
+    loadCfg(); loadQueue();
 
     const wsProto = location.protocol === 'https:' ? 'wss':'ws';
     const ws = new WebSocket(`${wsProto}://${location.host}/ws`);
@@ -225,14 +318,15 @@
         const m = JSON.parse(ev.data);
         if(m.type === 'log'){ appendLog(m.message); }
         else if(m.type === 'progress'){ updateJob(m); }
-        else if(m.type === 'done'){ appendLog(`${m.ok?'[ok]':'[error]'} ${m.file}`); }
+        else if(m.type === 'done'){ appendLog(`${m.ok?'[ok]':'[error]'} ${m.file}`); removeJob(m.file); }
         else if(m.type === 'queue_reset'){ qReset(); }
         else if(m.type === 'queue_append'){ qAppend(m.items || [], m.total); }
         else if(m.type === 'queue_pop'){ qPop(m.file); }
         else if(m.type === 'queue_move'){ qMove(m.file, m.to || 0); }
-        else if(m.type === 'paused'){ appendLog(`Paused current job: ${m.file||''}`); }
-        else if(m.type === 'resumed'){ appendLog(`Resumed job: ${m.file||''}`); }
-        else if(m.type === 'stopping'){ appendLog(`Stopping current job${m.file?': '+m.file:''}...`); }
+        else if(m.type === 'paused'){ setPausedUI(m.file, true); }
+        else if(m.type === 'resumed'){ setPausedUI(m.file, false); }
+        else if(m.type === 'job_stopped'){ removeJob(m.file); }
+        else if(m.type === 'jobs_clear'){ clearJobs(); }
       }catch(e){}
     };
     ws.onopen = ()=> appendLog('Connected.');
