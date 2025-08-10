@@ -1,57 +1,94 @@
-# Transcoder Debug UI
+# Universal In‑Place Transcoder + Debug UI
 
-Small FastAPI web UI to **scan**, **transcode/remux**, and **monitor progress** for a media library.
-It converts legacy/non-standard formats to **MP4 (H.264 + AAC)**, and remuxes already-compatible
-streams with `+faststart` for instant streaming.
+**Creator:** [code-418.com](https://code-418.com)  
+**License:** Public Domain (The Unlicense)
 
-- Live logs and per-file progress (percent, speed, ETA) via WebSockets
-- One-click scan of the configured target directory (recursive)
-- In-place replacement with safe temp files
-- Timestamp stabilization to reduce DTS/PTS warnings
-- Works on CPU (x264) or optionally NVENC (if your FFmpeg build + GPU support it)
+A tiny Dockerized service that recursively scans a directory, queues all videos,
+and converts non‑standard formats **in place** to streaming‑friendly **MP4 (H.264 + AAC)**.
+If a file is already H.264/AAC, it **remuxes** (container swap only) instead of
+re‑encoding — so it's lossless and finishes in seconds.
 
-**Created by [code-418.com](https://code-418.com)** — released into the public domain (see License).
+The **debug UI** (port `11223`) shows logs, a live queue, progress, ETA, and lets you:
+- **Scan** (populate queue only)
+- **Start** / **Stop** (strong stop: SIGINT → SIGTERM → SIGKILL, re‑queues current job)
+- Move an item to the **Top** of the queue
+- **Transcode Now** (pauses current job with `SIGSTOP`, runs the selected file, then `SIGCONT` to resume)
+
+---
+
+## Features
+
+- **Auto remux vs transcode** using ffprobe (H.264/AAC → remux; otherwise → H.264 + AAC).
+- **In‑place outputs** with atomic swap via `.<name>.transcoding.mp4` temp file.
+- **Fast‑start MP4** for web streaming.
+- **Queue controls** (Top, Now), **progress + ETA** via ffmpeg `-progress` pipe.
+- **Timestamps preserved**, optional keep original.
+- **Start/Stop decoupled** from scanning; queue persists across stops.
+
+---
 
 ## Quick start
 
 ```bash
-# Docker
-docker compose build
-docker compose up
-# open http://localhost:11223/
+docker compose up --build
+# open http://localhost:11223
+# Click Scan → Start
 ```
 
-Map your library root to `/data` in `docker-compose.yml`.
+By default, `./sample_data` is mounted to `/data`. Change the volume in `docker-compose.yml`
+to point at your media root when ready.
 
-## Configuration
+---
 
-All via environment variables (see `docker-compose.yml`):
+## Environment variables
 
-| Var | Default | Description |
-|-----|---------|-------------|
-| `TARGET_DIR` | `/data` | Root to scan recursively |
-| `CRF` | `22` | x264 quality (lower = higher quality/larger) |
-| `PRESET` | `veryfast` | x264 or NVENC preset (`ultrafast..medium` or `p1..p7` for NVENC) |
-| `AUDIO_BITRATE` | `160k` | AAC audio bitrate |
-| `USE_NVENC` | `false` | `true` to use NVIDIA NVENC (requires GPU + NVENC-enabled ffmpeg) |
-| `KEEP_ORIGINAL` | `false` | Keep original files alongside the MP4 outputs |
-| `PRESERVE_TIMESTAMPS` | `true` | Apply source mtime/atime to output |
-| `DRY_RUN` | `false` | Show what would happen without writing files |
-| `PORT` | `11223` | Web UI port |
+| Variable               | Default    | Description                                                                  |
+|------------------------|------------|------------------------------------------------------------------------------|
+| `TARGET_DIR`           | `/data`    | Root folder to scan recursively                                              |
+| `CRF`                  | `22`       | x264 quality (lower = better). Ignored when NVENC is used                    |
+| `PRESET`               | `veryfast` | x264/NVENC speed preset                                                      |
+| `AUDIO_BITRATE`        | `160k`     | AAC bitrate                                                                  |
+| `USE_NVENC`            | `false`    | Use `h264_nvenc` if your FFmpeg supports it                                  |
+| `KEEP_ORIGINAL`        | `false`    | Keep original file after success                                             |
+| `PRESERVE_TIMESTAMPS`  | `true`     | Copy atime/mtime from source to output                                       |
+| `DRY_RUN`              | `false`    | Don’t write any outputs; log only                                           |
 
-Supported extensions scanned: `avi, wmv, mov, mkv, flv, ts, m2ts, mts, m2t, mpg, mpeg, vob, mxf, webm, 3gp, 3g2, ogv, rm, rmvb, divx, xvid, f4v, m4v, mp4`.
+> The base image uses Debian ffmpeg which usually **does not** include NVENC. For GPU
+> encoding, switch to an FFmpeg build with NVENC and run with the NVIDIA container runtime.
 
-## Notes
+---
 
-- Temp files are named like `.<stem>.transcoding.mp4` to keep `.mp4` as the last extension for muxer detection.
-- We apply `-fflags +genpts`, `-vsync vfr`, audio resampling, and `-avoid_negative_ts make_zero` to stabilize timestamps.
-- NVENC may not be available in Alpine’s default FFmpeg builds. Use a custom FFmpeg image if you need NVENC.
+## Project layout
 
-## Contributing
+```
+universal-encoder/
+├─ app/
+│  ├─ main.py                # FastAPI backend + worker
+│  └─ static/
+│     └─ index.html          # Minimal live UI
+├─ Dockerfile
+├─ docker-compose.yml
+├─ requirements.txt
+├─ LICENSE
+├─ .gitignore
+└─ sample_data/.gitkeep
+```
 
-PRs welcome. By contributing, you agree to dedicate your changes to the public domain (The Unlicense).
+---
 
-## License
+## Changelog
 
-This is free and unencumbered software released into the public domain by **code-418.com**.
-See `LICENSE` (The Unlicense) for full text.
+### v1.0.0
+- Start/Stop separated from Scan
+- Visible queue with **Top** and **Now** actions
+- Priority **Now** job pauses current ffmpeg and resumes after
+- Strong Stop kills ffmpeg process group and re‑queues current/paused file
+- Auto **remux** when already H.264/AAC; otherwise **transcode** to H.264 + AAC
+- Progress + ETA + logs in UI
+
+---
+
+## Dev tips
+
+- If the UI looks stale (placeholders like `${it.file}`), hard‑refresh (Ctrl/Cmd + F5).
+- Use `DRY_RUN=true` to validate the scan/queue without writing files.

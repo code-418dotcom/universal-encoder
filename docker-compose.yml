@@ -1,17 +1,20 @@
+version: "3.9"
+
 services:
-  debugui:
+  transcoder-debug-ui:
     build: .
-    container_name: transcoder-debug-ui
+    container_name: universal-inplace-transcoder
+    restart: unless-stopped
     environment:
-      TARGET_DIR: /data
-      CRF: "22"
-      PRESET: veryfast
-      AUDIO_BITRATE: 160k
-      USE_NVENC: "false"
-      KEEP_ORIGINAL: "false"
-      PRESERVE_TIMESTAMPS: "true"
-      DRY_RUN: "false"
-    ports:
-      - "11223:11223"
+      - TARGET_DIR=/data
+      - CRF=22
+      - PRESET=veryfast
+      - AUDIO_BITRATE=160k
+      - USE_NVENC=false
+      - KEEP_ORIGINAL=false
+      - PRESERVE_TIMESTAMPS=true
+      - DRY_RUN=false
     volumes:
-      - /path/on/host:/data
+      - ./sample_data:/data
+    ports:
+      - "11223:8000"

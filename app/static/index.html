@@ -5,15 +5,16 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>Transcoder Debug UI</title>
   <style>
+    :root { --bg:#0f172a; --panel:#fff; --muted:#6b7280; --accent:#2563eb; --danger:#ef4444; --ok:#16a34a; }
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, 'Helvetica Neue', Arial, Noto Sans; margin: 0; color: #111; }
-    header { background: #0f172a; color: #fff; padding: 14px 18px; display: flex; align-items: center; gap: 14px;}
+    header { background: var(--bg); color: #fff; padding: 14px 18px; display: flex; align-items: center; gap: 14px;}
     header h1 { margin: 0; font-size: 18px; }
     main { display: grid; grid-template-columns: 420px 1fr; gap: 16px; padding: 16px; }
-    .panel { background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 12px; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
-    button { background: #2563eb; color: #fff; border: none; padding: 8px 12px; border-radius: 10px; cursor:pointer; }
+    .panel { background: var(--panel); border: 1px solid #e5e7eb; border-radius: 12px; padding: 12px; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+    button { background: var(--accent); color: #fff; border: none; padding: 6px 10px; border-radius: 8px; cursor:pointer; }
     button:disabled { opacity: .6; cursor: not-allowed; }
-    .muted { color: #6b7280; font-size: 12px; }
-    .log { font-family: ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; background: #0b1020; color:#e5e7eb; height: 48vh; overflow:auto; padding:10px; border-radius:10px; }
+    .muted { color: var(--muted); font-size: 12px; }
+    .log { font-family: ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; background: #0b1020; color:#e5e7eb; height: 42vh; overflow:auto; padding:10px; border-radius:10px; }
     .job { border-bottom: 1px dashed #e5e7eb; padding: 8px 0; }
     .name { font-weight: 600; font-size: 14px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .row { display:flex; align-items:center; justify-content:space-between; gap:10px; }
@@ -21,6 +22,15 @@
     .bar > div { height: 100%; background: linear-gradient(90deg,#22c55e, #86efac); width: 0%; transition: width .15s linear; }
     .tiny { font-size: 12px; color: #374151; }
     .grid { display:grid; gap:10px; }
+    .stack { display:grid; gap:16px; }
+    /* Queue */
+    .queue { height: 42vh; overflow:auto; border: 1px dashed #e5e7eb; border-radius: 10px; padding: 8px; background:#fafafa; }
+    .qitem { padding: 6px 6px; border-bottom: 1px solid #eee; display:grid; grid-template-columns: 1fr auto; gap: 8px; align-items:center; }
+    .qfile { font-weight: 600; font-size: 13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .qdir { font-size: 12px; color:#6b7280; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .qbtns { display:flex; gap:6px; }
+    .btn-now { background:#16a34a; }
+    .btn-top { background:#0ea5e9; }
   </style>
 </head>
 <body>
@@ -28,14 +38,21 @@
     <h1>Transcoder Debug UI</h1>
     <div id="cfg" class="muted"></div>
     <div style="margin-left:auto; display:flex; gap:10px">
-      <button id="scanBtn">Scan now</button>
-      <button id="stopBtn" style="background:#ef4444">Stop</button>
+      <button id="scanBtn">Scan</button>
+      <button id="startBtn" style="background: var(--ok)">Start</button>
+      <button id="stopBtn" style="background:var(--danger)">Stop</button>
     </div>
   </header>
   <main>
-    <section class="panel">
-      <h3>Jobs</h3>
-      <div id="jobs" class="grid"></div>
+    <section class="stack">
+      <section class="panel">
+        <h3>Queue <span id="qcount" class="muted"></span></h3>
+        <div id="queue" class="queue"></div>
+      </section>
+      <section class="panel">
+        <h3>Jobs</h3>
+        <div id="jobs" class="grid"></div>
+      </section>
     </section>
     <section class="panel">
       <h3>Logs</h3>
@@ -46,8 +63,11 @@
     const logEl = document.getElementById('log');
     const jobsEl = document.getElementById('jobs');
     const scanBtn = document.getElementById('scanBtn');
+    const startBtn = document.getElementById('startBtn');
     const stopBtn = document.getElementById('stopBtn');
     const cfgEl = document.getElementById('cfg');
+    const qEl = document.getElementById('queue');
+    const qCountEl = document.getElementById('qcount');
 
     function humanTime(s){
       if(s == null || !isFinite(s)) return '—';
@@ -57,12 +77,14 @@
     }
 
     const jobs = new Map();
+    const qMap = new Map(); // file -> element
+
     function ensureJob(file){
       if(!jobs.has(file)){
         const row = document.createElement('div');
         row.className = 'job';
         row.innerHTML = `
-          <div class="name" title="\${file}">\${file}</div>
+          <div class="name" title="${file}">${file}</div>
           <div class="row">
             <div class="bar"><div></div></div>
             <div class="tiny"><span class="pct">0%</span> • <span class="spd">—</span> • ETA <span class="eta">—</span></div>
@@ -87,6 +109,72 @@
       if(msg.stage === 'end'){ pct.textContent = '100%'; bar.style.width = '100%'; }
     }
 
+    async function api(path, body){
+      const res = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{})});
+      return res.json().catch(()=>({}));
+    }
+
+    function makeQItem(it){
+      const el = document.createElement('div');
+      el.className = 'qitem';
+      el.innerHTML = `
+        <div>
+          <div class="qfile" title="${it.file}">${it.file}</div>
+          <div class="qdir" title="${it.dir}">${it.dir}</div>
+        </div>
+        <div class="qbtns">
+          <button class="btn-top">Top</button>
+          <button class="btn-now">Now</button>
+        </div>
+      `;
+      el.querySelector('.btn-top').onclick = async ()=>{
+        await api('/queue/top', {file: it.file});
+      };
+      el.querySelector('.btn-now').onclick = async ()=>{
+        appendLog('Priority: ' + it.file);
+        await api('/transcode_now', {file: it.file});
+      };
+      return el;
+    }
+
+    function qAppend(items, total){
+      for(const it of items){
+        if(qMap.has(it.file)) continue;
+        const el = makeQItem(it);
+        qEl.appendChild(el);
+        qMap.set(it.file, el);
+      }
+      if(total !== undefined) qCountEl.textContent = `(${total} items)`;
+      else qCountEl.textContent = `(${qMap.size} items)`;
+    }
+
+    function qReset(){
+      qEl.innerHTML = '';
+      qMap.clear();
+      qCountEl.textContent = '';
+    }
+
+    function qPop(file){
+      const el = qMap.get(file);
+      if(el){
+        el.remove();
+        qMap.delete(file);
+        qCountEl.textContent = `(${qMap.size} items)`;
+      }
+    }
+
+    function qMove(file, toIndex){
+      const el = qMap.get(file);
+      if(!el) return;
+      qEl.removeChild(el);
+      const children = Array.from(qEl.children);
+      if(toIndex >= children.length){
+        qEl.appendChild(el);
+      } else {
+        qEl.insertBefore(el, children[toIndex]);
+      }
+    }
+
     function appendLog(text){
       const atBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 30;
       const time = new Date().toLocaleTimeString();
@@ -97,26 +185,54 @@
 
     async function loadCfg(){
       const res = await fetch('/config'); const cfg = await res.json();
-      cfgEl.textContent = \`\${cfg.target_dir} • CRF \${cfg.crf} • \${cfg.use_nvenc? 'NVENC':'x264'} • \${cfg.audio_bitrate}\`;
+      cfgEl.textContent = `${cfg.target_dir} • CRF ${cfg.crf} • ${cfg.use_nvenc? 'NVENC':'x264'} • ${cfg.audio_bitrate} • queue ${cfg.queue_len} • ${cfg.running? 'running':'idle'}`;
+    }
+    async function loadQueue(){
+      const res = await fetch('/queue');
+      const data = await res.json();
+      qReset();
+      qAppend(data.items, data.total);
     }
 
     scanBtn.onclick = async ()=>{
       scanBtn.disabled = true;
       await fetch('/scan',{method:'POST'});
-      setTimeout(()=>scanBtn.disabled=false, 1000);
+      await loadCfg();
+      await loadQueue();
+      setTimeout(()=>scanBtn.disabled=false, 500);
     };
-    stopBtn.onclick = async ()=>{ await fetch('/stop',{method:'POST'}); };
+    startBtn.onclick = async ()=>{
+      startBtn.disabled = true;
+      await fetch('/start',{method:'POST'});
+      await loadCfg();
+      setTimeout(()=>startBtn.disabled=false, 800);
+    };
+    stopBtn.onclick = async ()=>{
+      stopBtn.disabled = true;
+      const old = stopBtn.textContent;
+      stopBtn.textContent = 'Stopping...';
+      await fetch('/stop',{method:'POST'});
+      setTimeout(()=>{ stopBtn.disabled=false; stopBtn.textContent = old; }, 1200);
+    };
 
     loadCfg();
+    loadQueue();
 
     const wsProto = location.protocol === 'https:' ? 'wss':'ws';
-    const ws = new WebSocket(\`\${wsProto}://\${location.host}/ws\`);
+    const ws = new WebSocket(`${wsProto}://${location.host}/ws`);
     ws.onmessage = (ev)=>{
       try{
         const m = JSON.parse(ev.data);
         if(m.type === 'log'){ appendLog(m.message); }
         else if(m.type === 'progress'){ updateJob(m); }
-        else if(m.type === 'done'){ appendLog(\`\${m.ok?'[ok]':'[error]'} \${m.file}\`); }
+        else if(m.type === 'done'){ appendLog(`${m.ok?'[ok]':'[error]'} ${m.file}`); }
+        else if(m.type === 'queue_reset'){ qReset(); }
+        else if(m.type === 'queue_append'){ qAppend(m.items || [], m.total); }
+        else if(m.type === 'queue_pop'){ qPop(m.file); }
+        else if(m.type === 'queue_move'){ qMove(m.file, m.to || 0); }
+        else if(m.type === 'paused'){ appendLog(`Paused current job: ${m.file||''}`); }
+        else if(m.type === 'resumed'){ appendLog(`Resumed job: ${m.file||''}`); }
+        else if(m.type === 'stopping'){ appendLog(`Stopping current job${m.file?': '+m.file:''}...`); }
       }catch(e){}
     };
     ws.onopen = ()=> appendLog('Connected.');
