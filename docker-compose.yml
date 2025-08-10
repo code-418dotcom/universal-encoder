@@ -1,0 +1,17 @@
+services:
+  debugui:
+    build: .
+    container_name: transcoder-debug-ui
+    environment:
+      TARGET_DIR: /data
+      CRF: "22"
+      PRESET: veryfast
+      AUDIO_BITRATE: 160k
+      USE_NVENC: "false"
+      KEEP_ORIGINAL: "false"
+      PRESERVE_TIMESTAMPS: "true"
+      DRY_RUN: "false"
+    ports:
+      - "11223:11223"
+    volumes:
+      - /path/on/host:/data
