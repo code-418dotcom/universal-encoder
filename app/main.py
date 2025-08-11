@@ -45,6 +45,12 @@ ORIG_NAME:Dict[str,str]={}                               # normalized -> origina
 PAUSED_SET:set[str]=set()
 OPTIONS={"continuous_scan": False, "scan_interval": 60, "concurrency": 1, "auto_start": True}
 
+# Track finished and errored files so rescans can skip them and the UI can show history
+DONE_FILES:List[str]=[]     # successfully processed files (original paths)
+ERROR_FILES:List[str]=[]    # files that failed to process
+DONE_KEYS:set[str]=set()
+ERROR_KEYS:set[str]=set()
+
 # ---------- Helpers ----------
 def nkey(p:str)->str:
     """Normalize for stable, case-insensitive, unicode-safe matching."""
@@ -159,6 +165,7 @@ async def process_file(src:str):
     await wlog(f"Processing: {src} (duration={dur if dur else 'unknown'}s) transcode={trans}")
     if RUNTIME["dry_run"]: await wlog(f"[DRY_RUN] Would {'transcode' if trans else 'remux'} -> {dst}"); return True
 
+    key=nkey(src)
     rc=await run_ffmpeg(src,tmp,dur,trans)
     if rc==0:
         if RUNTIME["preserve_timestamps"]:
@@ -168,11 +175,21 @@ async def process_file(src:str):
         if not RUNTIME["keep_original"] and os.path.abspath(dst)!=os.path.abspath(src):
             try: os.remove(src)
             except Exception as e: await wlog(f"[warn] Could not remove original: {e}")
+        ERROR_KEYS.discard(key)
+        try: ERROR_FILES.remove(src)
+        except ValueError: pass
+        DONE_KEYS.add(key)
+        if src not in DONE_FILES: DONE_FILES.append(src)
         await wlog(f"[ok] {src} -> {dst}"); await ws.send({"type":"done","file":src,"ok":True})
     else:
-        try: 
+        try:
             if os.path.exists(tmp): os.remove(tmp)
         except Exception: pass
+        DONE_KEYS.discard(key)
+        try: DONE_FILES.remove(src)
+        except ValueError: pass
+        ERROR_KEYS.add(key)
+        if src not in ERROR_FILES: ERROR_FILES.append(src)
         await wlog(f"[error] ffmpeg rc={rc} for {src}"); await ws.send({"type":"done","file":src,"ok":False})
     return rc==0
 
@@ -208,12 +225,18 @@ async def get_queue():
     async with QUEUE_LOCK: items=[{"file":f,"dir":str(Path(f).parent)} for f in QUEUE]; total=len(QUEUE)
     return {"total":total,"items":items}
 
+@app.get("/finished")
+async def finished_jobs():
+    """Return lists of successfully processed and errored files."""
+    return {"done": DONE_FILES, "errors": ERROR_FILES}
+
 @app.post("/scan")
 async def api_scan():
     global QUEUE
     async with QUEUE_LOCK: QUEUE=[]
     await ws.send({"type":"queue_reset"})
-    running_keys=set(CURRENT_PROCS.keys())|set(PAUSED_SET)
+    # Skip currently running, paused, already done, or previously errored files
+    running_keys=set(CURRENT_PROCS.keys())|set(PAUSED_SET)|DONE_KEYS|ERROR_KEYS
     added=[]
     for d,_,files in os.walk(TARGET_DIR):
         for name in files:
