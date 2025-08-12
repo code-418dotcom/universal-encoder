@@ -300,6 +300,7 @@
     function addHistory(file, ok){
       const target = ok ? doneEl : errEl;
       const other = ok ? errEl : doneEl;
+      // remove duplicates from both lists
       for(const el of Array.from(target.children)){
         if(el.textContent === file){ el.remove(); }
       }
