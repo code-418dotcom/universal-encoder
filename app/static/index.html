@@ -298,10 +298,19 @@
       if(atBottom){ logEl.scrollTop = logEl.scrollHeight; }
     }
     function addHistory(file, ok){
+      const target = ok ? doneEl : errEl;
+      const other = ok ? errEl : doneEl;
+      // remove duplicates from both lists
+      for(const el of Array.from(target.children)){
+        if(el.textContent === file){ el.remove(); }
+      }
+      for(const el of Array.from(other.children)){
+        if(el.textContent === file){ el.remove(); }
+      }
       const el = document.createElement('div');
       el.className = 'hitem ' + (ok ? 'ok' : 'err');
       el.textContent = file;
-      (ok ? doneEl : errEl).appendChild(el);
+      target.appendChild(el);
     }
     async function loadHistory(){
       const res = await fetch('/finished');

@@ -2,7 +2,7 @@ import os, asyncio, json, time, signal, unicodedata
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Body
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -29,7 +29,7 @@ app.mount("/static", StaticFiles(directory=str(Path(__file__).parent/"static")),
 class WS:
     def __init__(self): self.active:List[WebSocket] = []
     async def connect(self,ws:WebSocket): await ws.accept(); self.active.append(ws)
-    def disconnect(self,ws:WebSocket): 
+    def disconnect(self,ws:WebSocket):
         if ws in self.active: self.active.remove(ws)
     async def send(self,msg:Dict[str,Any]):
         for ws in list(self.active):
@@ -163,7 +163,9 @@ async def process_file(src:str):
 
     await ws.send({"type":"queue_pop","file":src})
     await wlog(f"Processing: {src} (duration={dur if dur else 'unknown'}s) transcode={trans}")
-    if RUNTIME["dry_run"]: await wlog(f"[DRY_RUN] Would {'transcode' if trans else 'remux'} -> {dst}"); return True
+    if RUNTIME["dry_run"]:
+        await wlog(f"[DRY_RUN] Would {'transcode' if trans else 'remux'} -> {dst}")
+        return True
 
     key=nkey(src)
     rc=await run_ffmpeg(src,tmp,dur,trans)
@@ -175,14 +177,31 @@ async def process_file(src:str):
         if not RUNTIME["keep_original"] and os.path.abspath(dst)!=os.path.abspath(src):
             try: os.remove(src)
             except Exception as e: await wlog(f"[warn] Could not remove original: {e}")
-        DONE_KEYS.add(key); DONE_FILES.append(src)
-        await wlog(f"[ok] {src} -> {dst}"); await ws.send({"type":"done","file":src,"ok":True})
+
+        # ---- merged bookkeeping: success path ----
+        ERROR_KEYS.discard(key)
+        try: ERROR_FILES.remove(src)
+        except ValueError: pass
+        DONE_KEYS.add(key)
+        if src not in DONE_FILES: DONE_FILES.append(src)
+
+        await wlog(f"[ok] {src} -> {dst}")
+        await ws.send({"type":"done","file":src,"ok":True})
     else:
+        # cleanup temp if present
         try:
             if os.path.exists(tmp): os.remove(tmp)
         except Exception: pass
-        ERROR_KEYS.add(key); ERROR_FILES.append(src)
-        await wlog(f"[error] ffmpeg rc={rc} for {src}"); await ws.send({"type":"done","file":src,"ok":False})
+
+        # ---- merged bookkeeping: failure path ----
+        DONE_KEYS.discard(key)
+        try: DONE_FILES.remove(src)
+        except ValueError: pass
+        ERROR_KEYS.add(key)
+        if src not in ERROR_FILES: ERROR_FILES.append(src)
+
+        await wlog(f"[error] ffmpeg rc={rc} for {src}")
+        await ws.send({"type":"done","file":src,"ok":False})
     return rc==0
 
 # ---------- REST ----------
@@ -212,9 +231,32 @@ async def options_set(payload:Dict[str,Any]=Body(...)):
     if changed: await ws.send({"type":"options","options":OPTIONS})
     return {"status":"ok","options":OPTIONS}
 
+@app.post("/transcode_options")
+async def transcode_options(payload:Dict[str,Any]=Body(...)):
+    """Update runtime transcoding options."""
+    changed=False
+    if "crf" in payload:
+        RUNTIME["crf"] = str(payload["crf"]); changed=True
+    if "preset" in payload:
+        RUNTIME["preset"] = str(payload["preset"]); changed=True
+    if "audio_bitrate" in payload:
+        RUNTIME["audio_bitrate"] = str(payload["audio_bitrate"]); changed=True
+    if "use_nvenc" in payload:
+        RUNTIME["use_nvenc"] = bool(payload["use_nvenc"]); changed=True
+    if "keep_original" in payload:
+        RUNTIME["keep_original"] = bool(payload["keep_original"]); changed=True
+    if "preserve_timestamps" in payload:
+        RUNTIME["preserve_timestamps"] = bool(payload["preserve_timestamps"]); changed=True
+    if "dry_run" in payload:
+        RUNTIME["dry_run"] = bool(payload["dry_run"]); changed=True
+    if changed:
+        await ws.send({"type":"xcode","xcode":RUNTIME})
+    return {"status":"ok","xcode":RUNTIME}
+
 @app.get("/queue")
 async def get_queue():
-    async with QUEUE_LOCK: items=[{"file":f,"dir":str(Path(f).parent)} for f in QUEUE]; total=len(QUEUE)
+    async with QUEUE_LOCK:
+        items=[{"file":f,"dir":str(Path(f).parent)} for f in QUEUE]; total=len(QUEUE)
     return {"total":total,"items":items}
 
 @app.get("/finished")
