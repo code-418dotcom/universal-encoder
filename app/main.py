@@ -2,7 +2,7 @@ import os, asyncio, json, time, signal, unicodedata
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Body
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -29,7 +29,7 @@ app.mount("/static", StaticFiles(directory=str(Path(__file__).parent/"static")),
 class WS:
     def __init__(self): self.active:List[WebSocket] = []
     async def connect(self,ws:WebSocket): await ws.accept(); self.active.append(ws)
-    def disconnect(self,ws:WebSocket): 
+    def disconnect(self,ws:WebSocket):
         if ws in self.active: self.active.remove(ws)
     async def send(self,msg:Dict[str,Any]):
         for ws in list(self.active):
@@ -175,14 +175,31 @@ async def process_file(src:str):
         if not RUNTIME["keep_original"] and os.path.abspath(dst)!=os.path.abspath(src):
             try: os.remove(src)
             except Exception as e: await wlog(f"[warn] Could not remove original: {e}")
-        DONE_KEYS.add(key); DONE_FILES.append(src)
-        await wlog(f"[ok] {src} -> {dst}"); await ws.send({"type":"done","file":src,"ok":True})
+
+        # ---- merged bookkeeping: success path ----
+        ERROR_KEYS.discard(key)
+        try: ERROR_FILES.remove(src)
+        except ValueError: pass
+        DONE_KEYS.add(key)
+        if src not in DONE_FILES: DONE_FILES.append(src)
+
+        await wlog(f"[ok] {src} -> {dst}")
+        await ws.send({"type":"done","file":src,"ok":True})
     else:
+        # cleanup temp if present
         try:
             if os.path.exists(tmp): os.remove(tmp)
         except Exception: pass
-        ERROR_KEYS.add(key); ERROR_FILES.append(src)
-        await wlog(f"[error] ffmpeg rc={rc} for {src}"); await ws.send({"type":"done","file":src,"ok":False})
+
+        # ---- merged bookkeeping: failure path ----
+        DONE_KEYS.discard(key)
+        try: DONE_FILES.remove(src)
+        except ValueError: pass
+        ERROR_KEYS.add(key)
+        if src not in ERROR_FILES: ERROR_FILES.append(src)
+
+        await wlog(f"[error] ffmpeg rc={rc} for {src}")
+        await ws.send({"type":"done","file":src,"ok":False})
     return rc==0
 
 # ---------- REST ----------
