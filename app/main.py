@@ -98,6 +98,41 @@ async def ffprobe_codecs(path:str)->Dict[str,Optional[str]]:
         return t or None
     return {"v":await one("v"), "a":await one("a")}
 
+async def extract_english_subtitles(path:str):
+    """Extract English subtitle tracks from a video to .srt files."""
+    proc=await asyncio.create_subprocess_exec(
+        "ffprobe","-v","error","-select_streams","s",
+        "-show_entries","stream=index:stream_tags=language",
+        "-of","json",path,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    out,_=await proc.communicate()
+    if proc.returncode!=0:
+        return
+    try:
+        data=json.loads(out.decode() or "{}")
+    except Exception:
+        return
+    streams=data.get("streams",[])
+    idx=[s.get("index") for s in streams
+         if s.get("tags",{}).get("language","" ).lower() in ("en","eng","english")]
+    if not idx:
+        return
+    multi=len(idx)>1
+    base=Path(path).with_suffix("")
+    for i,pos in enumerate(idx):
+        out_srt=str(base)+(".en.srt" if not multi and i==0 else f".en{pos}.srt")
+        p=await asyncio.create_subprocess_exec(
+            "ffmpeg","-nostdin","-y","-i",path,
+            "-map",f"0:{pos}","-c:s","srt",out_srt,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        await p.communicate()
+        if p.returncode==0:
+            await wlog(f"[ok] extracted subtitles -> {out_srt}")
+        else:
+            await wlog(f"[warn] failed to extract subtitles from {path}")
+
 def build_ffmpeg_cmd(src:str, dst_tmp:str, transcode:bool)->list[str]:
     base=["ffmpeg","-nostdin","-fflags","+genpts","-y","-i",src]
     if transcode:
@@ -172,6 +207,7 @@ async def process_file(src:str):
             try: os.utime(tmp,(os.path.getatime(src),os.path.getmtime(src)))
             except Exception: pass
         os.replace(tmp,dst)
+        await extract_english_subtitles(dst)
         if not RUNTIME["keep_original"] and os.path.abspath(dst)!=os.path.abspath(src):
             try: os.remove(src)
             except Exception as e: await wlog(f"[warn] Could not remove original: {e}")
